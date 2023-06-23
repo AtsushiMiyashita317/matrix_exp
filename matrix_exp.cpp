@@ -2,6 +2,7 @@
 #include <numeric>
 #include <string>
 #include <tuple>
+#include <iostream>
 
 #include <torch/extension.h>
 
@@ -32,25 +33,80 @@ torch::Tensor _allocate_buffer(const torch::Tensor& a, int n_copies, bool is_zer
   return res;
 }
 
-inline torch::Tensor& my_matmul_out(torch::Tensor& out, const torch::Tensor& self, const torch::Tensor& other) {
-  auto n = self.size(-2);
-  if (n == self.size(-1)) {
-    at::matmul_out(out, self, other);
-  }
-  else {
-    auto view_out1 = out.narrow(-1, 0, n);
-    auto view_out2 = out.narrow(-1, n, n);
-    at::matmul_out(view_out1, self.narrow(-1, 0, n), other.narrow(-1, 0, n));
-    at::matmul_out(view_out2, self.narrow(-1, 0, n), other.narrow(-1, n, n));
-    view_out2.add_(at::matmul(self.narrow(-1, n, n), other.narrow(-1, 0, n)));
-  }
+inline torch::Tensor& pointsym_matmul_out(torch::Tensor& out, const torch::Tensor& self, const torch::Tensor& other) {
+  auto n = self.size(-1);
+  auto view_out1 = out.narrow(-2, 0, n);
+  at::matmul_out(view_out1, self.narrow(-2, 0, n), other.narrow(-2, 0, n));
+  view_out1.add_(
+    at::matmul(
+      self.narrow(-2, n-1, n).narrow(-1, 0, n-1).flip({-1,-2}).conj(), 
+      other.narrow(-2, n, n-1)
+    )
+  );
+  auto view_out2 = out.narrow(-2, n, n-1);
+  at::matmul_out(view_out2, self.narrow(-2, n, n-1), other.narrow(-2, 0, n));
+  view_out2.add_(
+    at::matmul(
+      self.narrow(-2, 0, n-1).narrow(-1, 0, n-1).flip({-1,-2}).conj(), 
+      other.narrow(-2, n, n-1)
+    )
+  );
   return out;
 }
 
-inline torch::Tensor my_matmul(const torch::Tensor& self, const torch::Tensor& other) {
+inline torch::Tensor& matmul_out_sw1(torch::Tensor& out, const torch::Tensor& self, const torch::Tensor& other) {
+  auto n = self.size(-1);
+  auto m = other.size(-2);
+  if (n == m) {
+    return at::matmul_out(out, self, other);
+  }
+  else {
+    return pointsym_matmul_out(out, self, other);
+  }
+}
+
+inline torch::Tensor matmul_sw1(const torch::Tensor& self, const torch::Tensor& other) {
   auto out = at::empty_like(self, self.options().memory_format(at::MemoryFormat::Contiguous));
-  my_matmul_out(out, self, other);
+  return matmul_out_sw1(out, self, other);
+}
+
+inline torch::Tensor& triblock_matmul_out(torch::Tensor& out, const torch::Tensor& self, const torch::Tensor& other) {
+  auto n = self.size(-1);
+  auto view_out1 = out.narrow(-2, 0, n);
+  auto view_out2 = out.narrow(-2, n, n);
+  // matmul_out_sw1(view_out1, self.narrow(-2, 0, n), other.narrow(-2, 0, n));
+  at::matmul_out(view_out1, self.narrow(-2, 0, n), other.narrow(-2, 0, n));
+  // matmul_out_sw1(view_out2, self.narrow(-2, 0, n), other.narrow(-2, n, n));
+  at::matmul_out(view_out2, self.narrow(-2, 0, n), other.narrow(-2, n, n));
+  // view_out2.add_(matmul_sw1(self.narrow(-2, n, n), other.narrow(-2, 0, n)));
+  view_out2.add_(at::matmul(self.narrow(-2, n, n), other.narrow(-2, 0, n)));
   return out;
+}
+
+inline torch::Tensor& matmul_out_sw2(torch::Tensor& out, const torch::Tensor& self, const torch::Tensor& other) {
+  auto n = self.size(-1);
+  auto m = other.size(-2);
+  // if ((n != m) && (m%2 == 0)) {
+  if (n != m) {
+    return triblock_matmul_out(out, self, other);
+  }
+  else {
+    // return matmul_out_sw1(out, self, other);
+    return at::matmul_out(out, self, other);
+  }
+}
+
+inline torch::Tensor matmul_sw2(const torch::Tensor& self, const torch::Tensor& other) {
+  auto out = at::empty_like(self, self.options().memory_format(at::MemoryFormat::Contiguous));
+  return matmul_out_sw2(out, self, other);
+}
+
+inline torch::Tensor& my_matmul_out(torch::Tensor& out, const torch::Tensor& self, const torch::Tensor& other) {
+  return matmul_out_sw2(out, self, other);
+}
+
+inline torch::Tensor my_matmul(const torch::Tensor& self, const torch::Tensor& other) {
+  return matmul_sw2(self, other);
 }
 
 // Makes `buffer` to store `num_matrices` number of matrices needed for
@@ -63,10 +119,10 @@ inline torch::Tensor my_matmul(const torch::Tensor& self, const torch::Tensor& o
 // buffer[num_matrices - 1, ...] = l[num_matries - 1]
 void _fill_matrix_powers(torch::Tensor& buffer, const torch::Tensor& a, int num_matrices) {
   auto a_sizes_minus_last = a.sizes().vec();
-  auto n = a.size(-2);
-  a_sizes_minus_last.pop_back();
+  auto n = a.size(-1);
+  a_sizes_minus_last.erase(a_sizes_minus_last.end()-2);
   // fill I
-  if (n == a.size(-1)) {
+  if (n == a.size(-2)) {
     buffer.select(0, 0).copy_(
       at::diag_embed(
         at::ones({1}, buffer.options())
@@ -75,13 +131,13 @@ void _fill_matrix_powers(torch::Tensor& buffer, const torch::Tensor& a, int num_
     );
   }
   else {
-    buffer.select(0, 0).narrow(-1, 0, n).copy_(
+    buffer.select(0, 0).narrow(-2, 0, n).copy_(
       at::diag_embed(
         at::ones({1}, buffer.options())
           .expand(a_sizes_minus_last)
       )
     );
-    buffer.select(0, 0).narrow(-1, n, n).zero_();
+    buffer.select(0, 0).narrow(-2, n, a.size(-2)-n).zero_();
   }
 
   // fill a
@@ -162,50 +218,94 @@ inline torch::Tensor _linear_combination(
 }
 
 // I + A
-torch::Tensor compute_T1(const torch::Tensor& A) {
-  // 2 for {I, A}
-  auto As = _allocate_buffer(A, 2);
-  _fill_matrix_powers(As, A, 2);
-  return As.sum(0);
+torch::Tensor compute_T1(const torch::Tensor& self, torch::Tensor& buffer) {
+  int max_batch = buffer.size(1);
+  int n_iter = (self.size(0) + max_batch -1) / max_batch;
+  auto out = at::empty_like(self);
+  auto view_buffer = buffer.narrow(0, 0, 2);
+
+  for (const auto i: c10::irange(n_iter)) {
+    int begin = i*max_batch;
+    int size = self.size(0) - begin;
+    size = std::min(max_batch, size);
+    auto As = view_buffer.narrow(1, 0, size);
+    auto A = self.narrow(0, begin, size);
+    auto view_out = out.narrow(0, begin, size);
+
+    // 2 for {I, A}
+    _fill_matrix_powers(As, A, 2);
+    at::sum_out(view_out, As, 0);
+  };
+  return out;
 }
 
 // I + A + A^2 / 2
-torch::Tensor compute_T2(const torch::Tensor& A) {
-  auto As = _allocate_buffer(A, 3);
-  // 3 for {I, A, A^2}
-  _fill_matrix_powers(As, A, 3);
-  As.select(0, 2).div_(2.0);
-  return As.sum(0);
+torch::Tensor compute_T2(const torch::Tensor& self, torch::Tensor& buffer) {
+  int max_batch = buffer.size(1);
+  int n_iter = (self.size(0) + max_batch -1) / max_batch;
+  auto out = at::empty_like(self);
+  auto view_buffer = buffer.narrow(0, 0, 3);
+
+  for (const auto i: c10::irange(n_iter)) {
+    int begin = i*max_batch;
+    int size = self.size(0) - begin;
+    size = std::min(max_batch, size);
+    auto As = view_buffer.narrow(1, 0, size);
+    auto A = self.narrow(0, begin, size);
+    auto view_out = out.narrow(0, begin, size);
+
+    // 3 for {I, A, A^2}
+    _fill_matrix_powers(As, A, 3);
+    As.select(0, 2).div_(2.0);
+    at::sum_out(view_out, As, 0);
+  };
+  return out;
 }
 
 // I + A + A^2 * (I / 2 + A / 6 + A^2 / 24)
 template <typename scalar_t>
-torch::Tensor compute_T4(const torch::Tensor& A) {
-  auto As = _allocate_buffer(A, 4);
-  // 3 for {I, A, A^2}
-  _fill_matrix_powers(As, A, 3);
+torch::Tensor compute_T4(const torch::Tensor& self, torch::Tensor& buffer) {
+  int max_batch = buffer.size(1);
+  int n_iter = (self.size(0) + max_batch -1) / max_batch;
+  auto out = at::empty_like(self);
+  auto view_buffer = buffer.narrow(0, 0, 4);
 
-  // output for A^2 * (I / 2 + A / 6 + A^2 / 24)
-  auto view_out = As.select(0, 3);
-  my_matmul_out(
-    view_out,
-    // contains A^2
-    As.select(0, 2),
-    // computes (I / 2 + A / 6 + A^2 / 24)
-    _linear_combination<scalar_t>(
-      As.narrow(0, 0, 3),
-      {1 / 2.0, 1 / 6.0, 1 / 24.0}
-    )
-  );
+  for (const auto i: c10::irange(n_iter)) {
+    int begin = i*max_batch;
+    int size = self.size(0) - begin;
+    size = std::min(max_batch, size);
+    auto As = view_buffer.narrow(1, 0, size);
+    auto A = self.narrow(0, begin, size);
+    auto view_out = out.narrow(0, begin, size);
+    
+    // 3 for {I, A, A^2}
+    _fill_matrix_powers(As, A, 3);
 
-  // I + A + A^2 * (I / 2 + A / 6 + A^2 / 24)
-  return _linear_combination<scalar_t>(
-    As, {1.0, 1.0, 0.0, 1.0}
-  );
+    // output for A^2 * (I / 2 + A / 6 + A^2 / 24)
+    auto tmp = As.select(0, 3);
+    my_matmul_out(
+      tmp,
+      // contains A^2
+      As.select(0, 2),
+      // computes (I / 2 + A / 6 + A^2 / 24)
+      _linear_combination<scalar_t>(
+        As.narrow(0, 0, 3),
+        {1 / 2.0, 1 / 6.0, 1 / 24.0}
+      )
+    );
+
+    // I + A + A^2 * (I / 2 + A / 6 + A^2 / 24)
+    view_out.copy_(
+      _linear_combination<scalar_t>(
+        As, {1.0, 1.0, 0.0, 1.0}
+      )
+    );
+  };
+  return out;
 }
 
 template <typename scalar_t>
-torch::Tensor compute_T8(const torch::Tensor& A) {
+torch::Tensor compute_T8(const torch::Tensor& self, torch::Tensor& buffer) {
   constexpr scalar_t sqrt_177 = 0.1330413469565007072504e+2;
   constexpr scalar_t x3 = 2. / 3.;
   constexpr scalar_t x1 = x3 * ((1. + sqrt_177) / 88.);
@@ -216,48 +316,64 @@ torch::Tensor compute_T8(const torch::Tensor& A) {
   constexpr scalar_t x7 = (89. - sqrt_177) / (5040. * x3);
   constexpr scalar_t y2 = (857. - 58. * sqrt_177) / 630.;
 
-  auto As = _allocate_buffer(A, 5);
-  // 3 for {I, A, A^2}
-  _fill_matrix_powers(As, A, 3);
+  int max_batch = buffer.size(1);
+  int n_iter = (self.size(0) + max_batch -1) / max_batch;
+  auto out = at::empty_like(self);
+  auto view_buffer = buffer.narrow(0, 0, 5);
+  
+  for (const auto i: c10::irange(n_iter)) {
+    int begin = i*max_batch;
+    int size = self.size(0) - begin;
+    size = std::min(max_batch, size);
+    auto As = view_buffer.narrow(1, 0, size);
+    auto A = self.narrow(0, begin, size);
+    auto view_out = out.narrow(0, begin, size);
+    
+    // 3 for {I, A, A^2}
+    _fill_matrix_powers(As, A, 3);
 
-  // output for A4
-  auto view_out = As.select(0, 3);
-  // A4 =  A2 * (x1 * A + x2 * A2)
-  my_matmul_out(
-    view_out,
-    // As.select(0, 2) = A^2
-    As.select(0, 2),
-    _linear_combination<scalar_t>(
-      // extract {A, A^2} from As
-      As.narrow(0, 1, 2),
-      {x1, x2}
-    )
-  );
+    // output for A4
+    auto tmp = As.select(0, 3);
+    // A4 =  A2 * (x1 * A + x2 * A2)
+    my_matmul_out(
+      tmp,
+      // As.select(0, 2) = A^2
+      As.select(0, 2),
+      _linear_combination<scalar_t>(
+        // extract {A, A^2} from As
+        As.narrow(0, 1, 2),
+        {x1, x2}
+      )
+    );
 
-  // output for A8
-  view_out = As.select(0, 4);
-  // A8 = (x3 * A2 + A4) * (x4 * I + x5 * A + x6 * A2 + x7 * A4)
-  my_matmul_out(
-    view_out,
-    // x3 * A2 + A4
-    _linear_combination<scalar_t>(
-      As.narrow(0, 2, 2),
-      {x3, 1.0}
-    ),
-    _linear_combination<scalar_t>(
-      As.narrow(0, 0, 4),
-      {x4, x5, x6, x7}
-    )
-  );
+    // output for A8
+    tmp = As.select(0, 4);
+    // A8 = (x3 * A2 + A4) * (x4 * I + x5 * A + x6 * A2 + x7 * A4)
+    my_matmul_out(
+      tmp,
+      // x3 * A2 + A4
+      _linear_combination<scalar_t>(
+        As.narrow(0, 2, 2),
+        {x3, 1.0}
+      ),
+      _linear_combination<scalar_t>(
+        As.narrow(0, 0, 4),
+        {x4, x5, x6, x7}
+      )
+    );
 
-  // return I + A + y2 * A2 + A8;
-  return _linear_combination<scalar_t>(
-    As, {1.0, 1.0, y2, 0.0, 1.0}
-  );
+    // return I + A + y2 * A2 + A8;
+    view_out.copy_(
+      _linear_combination<scalar_t>(
+        As, {1.0, 1.0, y2, 0.0, 1.0}
+      )
+    );
+  }
+  return out;
 }
 
 template <typename scalar_t>
-torch::Tensor compute_T12(const torch::Tensor& A) {
+torch::Tensor compute_T12(const torch::Tensor& self, torch::Tensor& buffer) {
   constexpr int num_prods = 4;
   array2d<scalar_t, num_prods, num_prods> b = {{
     {
@@ -292,33 +408,49 @@ torch::Tensor compute_T12(const torch::Tensor& A) {
     reinterpret_cast<void*>(&b),
     {num_prods, num_prods},
     {num_prods, 1},
-    c10::toRealValueType(A.scalar_type())
+    c10::toRealValueType(self.scalar_type())
   );
-  bs = _move_memory_if_cuda_input(bs, A);
+  bs = _move_memory_if_cuda_input(bs, self);
 
-  auto As = _allocate_buffer(A, num_prods);
-  _fill_matrix_powers(As, A, num_prods);
+  int max_batch = buffer.size(1);
+  int n_iter = (self.size(0) + max_batch -1) / max_batch;
+  auto out = at::empty_like(self);
+  auto view_buffer = buffer.narrow(0, 0, num_prods);
+  
+  for (const auto i: c10::irange(n_iter)) {
+    int begin = i*max_batch;
+    int size = self.size(0) - begin;
+    size = std::min(max_batch, size);
+    auto As = view_buffer.narrow(1, 0, size);
+    auto A = self.narrow(0, begin, size);
+    auto view_out = out.narrow(0, begin, size);
+    
+    _fill_matrix_powers(As, A, num_prods);
 
-  auto Bs = at::native::_compute_linear_combination(As, bs);
+    auto Bs = at::native::_compute_linear_combination(As, bs);
 
-  // output for A6
-  auto view_out = As.select(0, 0);
-  // compute A6
-  Bs.select(0, 2).add_(my_matmul_out(
-    view_out,
-    Bs.select(0, 3),
-    Bs.select(0, 3)
-  ));
+    // output for A6
+    auto tmp = As.select(0, 0);
+    // compute A6
+    Bs.select(0, 2).add_(my_matmul_out(
+      tmp,
+      Bs.select(0, 3),
+      Bs.select(0, 3)
+    ));
 
-  return Bs.select(0, 0).add_(my_matmul_out(
-    view_out,
-    Bs.select(0, 1).add_(Bs.select(0, 2)),
-    Bs.select(0, 2)
-  ));
+    view_out.copy_(
+      Bs.select(0, 0).add_(my_matmul_out(
+        tmp,
+        Bs.select(0, 1).add_(Bs.select(0, 2)),
+        Bs.select(0, 2)
+      ))
+    );
+  }
+  return out;
 }
 
 template <typename scalar_t>
-torch::Tensor compute_T18(const torch::Tensor& A) {
+torch::Tensor compute_T18(const torch::Tensor& self, torch::Tensor& buffer) {
   constexpr int num_prods = 5;
   array2d<scalar_t, num_prods, num_prods> b = {{
     {
@@ -364,29 +496,45 @@ torch::Tensor compute_T18(const torch::Tensor& A) {
     reinterpret_cast<void*>(&b),
     {num_prods, num_prods},
     {num_prods, 1},
-    c10::toRealValueType(A.scalar_type())
+    c10::toRealValueType(self.scalar_type())
   );
-  bs = _move_memory_if_cuda_input(bs, A);
+  bs = _move_memory_if_cuda_input(bs, self);
 
-  auto As = _allocate_buffer(A, num_prods);
-  _fill_matrix_powers(As, A, num_prods);
+  int max_batch = buffer.size(1);
+  int n_iter = (self.size(0) + max_batch -1) / max_batch;
+  auto out = at::empty_like(self);
+  auto view_buffer = buffer.narrow(0, 0, num_prods);
+  
+  for (const auto i: c10::irange(n_iter)) {
+    int begin = i*max_batch;
+    int size = self.size(0) - begin;
+    size = std::min(max_batch, size);
+    auto As = view_buffer.narrow(1, 0, size);
+    auto A = self.narrow(0, begin, size);
+    auto view_out = out.narrow(0, begin, size);
 
-  auto Bs = at::native::_compute_linear_combination(As, bs);
+    _fill_matrix_powers(As, A, num_prods);
 
-  // tmp buffer for this matrix product
-  auto view_out = As.select(0, 0);
-  // compute A9
-  Bs.select(0, 3).add_(my_matmul_out(
-    view_out,
-    Bs.select(0, 0),
-    Bs.select(0, 4))
-  );
+    auto Bs = at::native::_compute_linear_combination(As, bs);
 
-  return Bs.select(0, 1).add_(my_matmul_out(
-    view_out,
-    Bs.select(0, 2).add_(Bs.select(0, 3)),
-    Bs.select(0, 3)
-  ));
+    // tmp buffer for this matrix product
+    auto tmp = As.select(0, 0);
+    // compute A9
+    Bs.select(0, 3).add_(my_matmul_out(
+      tmp,
+      Bs.select(0, 0),
+      Bs.select(0, 4))
+    );
+
+    view_out.copy_(
+      Bs.select(0, 1).add_(my_matmul_out(
+        tmp,
+        Bs.select(0, 2).add_(Bs.select(0, 3)),
+        Bs.select(0, 3)
+      ))
+    );
+  }
+  return out;
 }
 
 template <typename scalar_t>
@@ -394,7 +542,8 @@ void compute_T18_scale_square(
   torch::Tensor& mexp_out,
   const torch::Tensor& a,
   const torch::Tensor& norm,
-  scalar_t theta
+  scalar_t theta,
+  torch::Tensor& buffer
 ) {
   // Scale
   const auto s = at::max(
@@ -405,7 +554,7 @@ void compute_T18_scale_square(
   const auto a_scaled = a / pow2s;
 
   // Square
-  auto mexp_scaled = compute_T18<scalar_t>(a_scaled);
+  auto mexp_scaled = compute_T18<scalar_t>(a_scaled, buffer);
   auto s_cpu = (s.device().type() == at::kCPU)
     ? s : s.to(at::kCPU);
   for (const auto i : c10::irange(mexp_scaled.size(0))) {
@@ -422,9 +571,15 @@ template <typename scalar_t>
 torch::Tensor mexp_impl(
   const torch::Tensor& a,
   std::array<scalar_t, total_n_degs> thetas,
+  int max_length,
   bool compute_highest_degree_approx = false
 ) {
   auto res = at::empty_like(a);
+  int volume = a.size(-2) * a.size(-1);
+  int max_batch = (max_length * max_length + volume -1) / volume;
+  int full = a.size(0);
+  max_batch = std::min(max_batch, full);
+  auto buffer = _allocate_buffer(a.narrow(0, 0, max_batch), 5);
   const auto norm = operator_1_norm(a);
   // `norm_cpu` is used to decide which Tensors require which approximation
   // based on their norm. This decision takes place on CPU.
@@ -436,7 +591,7 @@ torch::Tensor mexp_impl(
 
   if (!compute_highest_degree_approx) {
     constexpr std::array<
-      torch::Tensor(*)(const torch::Tensor&),
+      torch::Tensor(*)(const torch::Tensor&, torch::Tensor&),
       total_n_degs - 1>
     compute_Ts = {
       compute_T1, compute_T2, compute_T4<scalar_t>,
@@ -456,7 +611,7 @@ torch::Tensor mexp_impl(
           idx_curr_norm_interval, a
         );
         auto sub_a = at::index_select(a, 0, idx_to_device);
-        res.index_put_({idx_to_device}, compute_Ts[i](sub_a));
+        res.index_put_({idx_to_device}, compute_Ts[i](sub_a, buffer));
       }
     }
 
@@ -476,7 +631,8 @@ torch::Tensor mexp_impl(
         mexp_out,
         a_large_norm,
         large_norm_subset,
-        thetas[total_n_degs - 1]
+        thetas[total_n_degs - 1],
+        buffer
       );
       res.index_put_({idx_large_norm}, mexp_out);
     }
@@ -486,7 +642,8 @@ torch::Tensor mexp_impl(
 
   compute_T18_scale_square(
     res, a, norm,
-    thetas[total_n_degs - 1]
+    thetas[total_n_degs - 1],
+    buffer
   );
 
   return res;
@@ -496,11 +653,7 @@ torch::Tensor mexp_impl(
 torch::Tensor mexp(const torch::Tensor& a, int max_length, bool compute_highest_degree_approx = false) {
   // squash batch dimensions to one dimension for simplicity
   const auto a_3d = a.view({-1, a.size(-2), a.size(-1)});
-  auto mexp_3d = at::empty_like(a_3d);
-  int volume = a.size(-2) * a.size(-1);
-  int max_batch = (max_length * max_length + volume -1) / volume;
-  int n_iter = (a.size(0) + max_batch -1) / max_batch;
-
+  
   if (a.scalar_type() == at::ScalarType::Float
       || a.scalar_type() == at::ScalarType::ComplexFloat) {
     constexpr std::array<float, total_n_degs> thetas_float = {
@@ -512,19 +665,8 @@ torch::Tensor mexp(const torch::Tensor& a, int max_length, bool compute_highest_
       3.010066362817634e+00  // deg 18
     };
 
-    for (const auto i: c10::irange(n_iter)) {
-      int a = i*max_batch;
-      int b = a_3d.size(0) - a;
-      b = std::min(max_batch, b);
-      mexp_3d.narrow(0, a, b).copy_(
-        mexp_impl<float>(
-          a_3d.narrow(0, a, b), 
-          thetas_float, 
-          compute_highest_degree_approx
-        )
-      );
-    };
-    return mexp_3d.view(a.sizes());
+    return mexp_impl<float>(a_3d, thetas_float, max_length, compute_highest_degree_approx)
+      .view(a.sizes());
   }
   else { // if Double or ComplexDouble
     constexpr std::array<double, total_n_degs> thetas_double = {
@@ -536,19 +678,8 @@ torch::Tensor mexp(const torch::Tensor& a, int max_length, bool compute_highest_
       1.090863719290036e+00  // deg 18
     };
 
-    for (const auto i: c10::irange(n_iter)) {
-      int a = i*max_batch;
-      int b = a_3d.size(0) - a;
-      b = std::min(max_batch, b);
-      mexp_3d.narrow(0, a, b).copy_(
-        mexp_impl<double>(
-          a_3d.narrow(0, a, b), 
-          thetas_double, 
-          compute_highest_degree_approx
-        )
-      );
-    };
-    return mexp_3d.view(a.sizes());
+    return mexp_impl<double>(a_3d, thetas_double, max_length, compute_highest_degree_approx)
+      .view(a.sizes());
   }
 }
 
@@ -557,18 +688,27 @@ torch::Tensor mexp(const torch::Tensor& a, int max_length, bool compute_highest_
 torch::Tensor backward_mexp(
     const torch::Tensor& self, const torch::Tensor& grad, int max_length
   ) {
+  // int n = self.size(-1);
+  // torch::Tensor self_transposed = at::empty_like(self);
+  // if (n == self.size(-2)) {
+  //   self_transposed.copy_(self.mH());
+  // }
+  // else {
+  //   self_transposed.narrow(-2, 0, n).copy_(self.narrow(-2, 0, n).mH());
+  //   self_transposed.narrow(-2, n, n-1).copy_(self.narrow(-2, n-1, n).narrow(-1, 0, n-1).flip({-1,-2}).mT());
+  // }
   auto self_transposed = self.mH();
   auto self_transposed_sizes = self_transposed.sizes().vec();
-  // self_transposed_sizes[self.dim() - 2] <<= 1;
-  self_transposed_sizes[self.dim() - 1] <<= 1;
+  self_transposed_sizes[self.dim() - 2] <<= 1;
+  // self_transposed_sizes[self.dim() - 1] <<= 1;
 
-  auto n = self_transposed.size(-1);
+  int n = self.size(-2);
   auto meta_grad = at::zeros(self_transposed_sizes, grad.options());
-  meta_grad.narrow(-1, 0, n).copy_(self_transposed);
+  meta_grad.narrow(-2, 0, n).copy_(self_transposed);
   // meta_grad.narrow(-2, n, n).narrow(-1, n, n).copy_(self_transposed);
-  meta_grad.narrow(-1, n, n).copy_(grad);
+  meta_grad.narrow(-2, n, n).copy_(grad);
 
-  auto grad_input = mexp(meta_grad, max_length).narrow(-1, n, n);
+  auto grad_input = mexp(meta_grad, max_length).narrow(-2, n, n);
   return grad_input;
 }
 } // end anon namespace
